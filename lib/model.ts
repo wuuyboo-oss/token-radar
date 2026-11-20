@@ -1,4 +1,4 @@
-// radar-2: scoring a snapshot of the protocol universe into a ranked board.
+// radar-3: scoring a snapshot of the protocol universe into a ranked board.
 //
 // The job, in one sentence: look at every protocol that has real locked value and
 // no token yet, and put a defensible dollar figure on what its token would be worth
@@ -6,6 +6,21 @@
 // names a protocol, a chain, or a category in advance; every number the model uses is
 // either read straight from the snapshot or calibrated from the snapshot's own
 // live-token protocols, so the same code scores a different snapshot differently.
+//
+// radar-3 changes exactly one thing from radar-2, and only because the backtest
+// (lib/backtest.ts) measured it: the size effect. The snapshot's own live tokens show
+// log(mcap/TVL) falling with log(TVL) at a slope of about -0.29, so a protocol far
+// above its category's live median TVL now scores at a lower multiple, by that
+// measured slope, clamped so size can never halve or double a multiple on its own.
+// Leave-one-out over the snapshot's 118 clean live-token protocols: median absolute
+// log error 1.59 for radar-2, 1.45 for radar-3 (mean 1.82 to 1.75, within-2x 26% to
+// 28%). Everything else the backtest tried did not earn its place: a stronger prior
+// (4/12/16/20) is noise on its own and a coin flip in combination (51 protocols
+// better, 56 worse), the log-scale chain factor changes nothing, and growth damping
+// above +20% touches no live protocol at all, so the backtest cannot measure it and
+// it stays off. The age bell curve is unchanged: the snapshot carries no
+// token-launch dates for live protocols, so the launch-window peak cannot be
+// calibrated from it.
 //
 // How the figure is built, for one protocol:
 //
@@ -29,7 +44,12 @@
 //                       chains: a protocol live in many places has more doors to launch
 //                       through than one confined to a single chain.
 //
-//   implied value = max(1, round(tvl x category multiple x growth x age x chain))
+//   size factor         the size effect, measured from the snapshot's own live tokens:
+//                       log(mcap/TVL) falls with log(TVL), so a protocol far above its
+//                       category's live median TVL scores at a lower multiple, by the
+//                       measured slope, clamped to 0.5x-1.5x.
+//
+//   implied value = max(1, round(tvl x category multiple x size factor x growth x age x chain))
 //
 // The board itself is the watchlist first -- every slug the snapshot's watchlist
 // names, whatever its TVL -- plus the strongest pre-token protocols below the
@@ -74,6 +94,8 @@ export interface ModelConstants {
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
+  growth_damp_above: number;
+  growth_damp_power: number;
   distress_threshold: number;
   distress_discount: number;
   age_floor: number;
@@ -83,6 +105,11 @@ export interface ModelConstants {
   unknown_age_multiplier: number;
   chain_step: number;
   chain_max: number;
+  chain_mode: 'linear' | 'log';
+  chain_log_k: number;
+  size_decay_strength: number;
+  size_factor_floor: number;
+  size_factor_cap: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -94,6 +121,8 @@ export const MODEL: ModelConstants = {
   growth_weight: 0.8,
   growth_floor: -40,
   growth_cap: 60,
+  growth_damp_above: 60,
+  growth_damp_power: 1,
   distress_threshold: -20,
   distress_discount: 0.92,
   age_floor: 0.6,
@@ -103,10 +132,15 @@ export const MODEL: ModelConstants = {
   unknown_age_multiplier: 0.85,
   chain_step: 0.015,
   chain_max: 12,
+  chain_mode: 'linear',
+  chain_log_k: 0.05,
+  size_decay_strength: 1,
+  size_factor_floor: 0.5,
+  size_factor_cap: 1.5,
 };
 
 /** The version tag the dashboard prints next to the model name. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many sub-floor pre-token protocols the early radar may add, by TVL. */
 export const EARLY_ROWS = 160;
@@ -139,6 +173,7 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     category_multiple: number;
+    size_multiplier: number;
     growth_pct: number;
     growth_multiplier: number;
     age_multiplier: number;
@@ -162,6 +197,7 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   category_multiple: number;
+  size_multiplier: number;
   growth_multiplier: number;
   age_multiplier: number;
   chain_multiplier: number;
@@ -184,12 +220,15 @@ export interface CategoryCalibration {
   live_count: number;
   median_ratio: number | null;
   multiple: number;
+  median_tvl: number | null;
 }
 
 /** The calibration the snapshot's live tokens produce, for the whole market and per category. */
 export interface Calibration {
   overall_median_ratio: number;
   live_count: number;
+  overall_median_tvl: number;
+  size_slope: number;
   by_category: Record<string, CategoryCalibration>;
 }
 
@@ -250,18 +289,27 @@ const round4dp = (n: number): number => Math.round(n * 1e4) / 1e4;
  * by a prior worth `prior_strength` protocols. A thin category therefore leans on the
  * market average instead of trusting a lone outlier; a category with no live protocol
  * at all is left out here and falls back to the overall median when it is scored.
+ * The calibration also measures the size effect: the ordinary-least-squares slope of
+ * log(mcap/TVL) on log(TVL) across the live tokens. A negative slope means bigger
+ * protocols trade at lower multiples, and the model damps the multiple of a protocol
+ * far above its category's live median TVL by that slope (see sizeFactor).
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
   const live = snapshot.protocols.filter((p) => !isPreToken(p) && p.tvl_usd > 0 && p.mcap_usd !== null);
   const ratioOf = (p: SnapshotProtocol): number =>
     Math.min(model.ratio_cap, Math.max(model.ratio_floor, (p.mcap_usd as number) / p.tvl_usd));
   const overall = medianSorted(live.map(ratioOf).sort((a, b) => a - b));
+  const overallMedianTvl = medianSorted(live.map((p) => p.tvl_usd).sort((a, b) => a - b));
   const perCategory = new Map<string, number[]>();
+  const perCategoryTvl = new Map<string, number[]>();
   for (const p of live) {
     const key = p.category ?? 'Other';
     const ratios = perCategory.get(key) ?? [];
     ratios.push(ratioOf(p));
     perCategory.set(key, ratios);
+    const tvls = perCategoryTvl.get(key) ?? [];
+    tvls.push(p.tvl_usd);
+    perCategoryTvl.set(key, tvls);
   }
   const out: Record<string, CategoryCalibration> = {};
   const keys = [...perCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
@@ -269,9 +317,50 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
     const med = medianSorted([...ratios].sort((a, b) => a - b));
     const shrunk = (ratios.length * med + model.prior_strength * overall) / (ratios.length + model.prior_strength);
     const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
-    out[key] = { live_count: ratios.length, median_ratio: round4dp(med), multiple: round4dp(multiple) };
+    const tvls = perCategoryTvl.get(key) ?? [];
+    out[key] = {
+      live_count: ratios.length,
+      median_ratio: round4dp(med),
+      multiple: round4dp(multiple),
+      median_tvl: tvls.length > 0 ? medianSorted([...tvls].sort((a, b) => a - b)) : null,
+    };
   }
-  return { overall_median_ratio: round4dp(overall), live_count: live.length, by_category: out };
+  return {
+    overall_median_ratio: round4dp(overall),
+    live_count: live.length,
+    overall_median_tvl: overallMedianTvl,
+    size_slope: sizeSlope(live, ratioOf),
+    by_category: out,
+  };
+}
+
+/**
+ * The size effect, measured, not asserted: the OLS slope of log(mcap/TVL) on
+ * log(TVL) across the live tokens. Returns 0 when there are too few live tokens
+ * to measure a slope, so the size factor stays neutral.
+ */
+function sizeSlope(live: SnapshotProtocol[], ratioOf: (p: SnapshotProtocol) => number): number {
+  if (live.length < 8) return 0;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const p of live) {
+    if (p.tvl_usd <= 0) continue;
+    xs.push(Math.log(p.tvl_usd));
+    ys.push(Math.log(ratioOf(p)));
+  }
+  if (xs.length < 8) return 0;
+  const n = xs.length;
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0;
+  let sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sxy += (xs[i]! - mx) * (ys[i]! - my);
+    sxx += (xs[i]! - mx) * (xs[i]! - mx);
+  }
+  if (sxx === 0) return 0;
+  const slope = sxy / sxx;
+  return Number.isFinite(slope) ? slope : 0;
 }
 
 /** The multiple a category scores at: its calibrated one, or the overall median unpriced. */
@@ -285,7 +374,14 @@ export function categoryMultiple(category: string | null, calibration: Calibrati
 function growthFactor(change7d: number | null, model: ModelConstants): { pct: number; factor: number } {
   const raw = numOr(change7d, 0);
   const pct = Math.min(model.growth_cap, Math.max(model.growth_floor, raw));
-  let factor = 1 + (pct / 100) * model.growth_weight;
+  // The positive tail is damped when the model says so: a one-week spike far above
+  // the damp point counts for less than its full size, because a single large deposit
+  // is not durable momentum. The damp point and power are measured by the backtest.
+  let effectivePct = pct;
+  if (pct > model.growth_damp_above && model.growth_damp_power < 1) {
+    effectivePct = model.growth_damp_above + Math.pow(pct - model.growth_damp_above, model.growth_damp_power);
+  }
+  let factor = 1 + (effectivePct / 100) * model.growth_weight;
   if (raw < model.distress_threshold) factor *= model.distress_discount;
   return { pct, factor };
 }
@@ -299,27 +395,54 @@ function ageFactor(age: number | null, model: ModelConstants): number {
 
 /** The reach factor: a little more for every chain, up to the cap. */
 function chainFactor(chainCount: number, model: ModelConstants): number {
-  return 1 + model.chain_step * Math.min(chainCount, model.chain_max);
+  const n = Math.min(chainCount, model.chain_max);
+  // Log mode: diminishing returns per extra chain, because a protocol already on
+  // many chains got part of its TVL from being there. At 12 chains both modes land
+  // near +12%; the log mode just stops paying full price for the 8th chain onward.
+  if (model.chain_mode === 'log') return 1 + model.chain_log_k * Math.log(1 + n);
+  return 1 + model.chain_step * n;
 }
 
-/** One protocol's implied value and the four factors that produced it. */
+/**
+ * The size factor: when the measured slope is negative, a protocol far above its
+ * category's live median TVL scores at a lower multiple, because bigger protocols
+ * trade at lower mcap/TVL. The strength scales the measured slope (0 is off), and
+ * the factor is clamped so size can never halve or double a multiple on its own.
+ */
+function sizeFactor(tvl: number, category: string | null, calibration: Calibration, model: ModelConstants): number {
+  if (model.size_decay_strength === 0 || calibration.size_slope >= 0 || tvl <= 0) return 1;
+  const entry = calibration.by_category[category ?? 'Other'];
+  const medianTvl = entry?.median_tvl ?? calibration.overall_median_tvl;
+  if (medianTvl === null || medianTvl <= 0) return 1;
+  const raw = Math.pow(tvl / medianTvl, calibration.size_slope * model.size_decay_strength);
+  if (!Number.isFinite(raw) || raw <= 0) return 1;
+  return Math.min(model.size_factor_cap, Math.max(model.size_factor_floor, raw));
+}
+
+/** One protocol's implied value and the five factors that produced it. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   calibration: Calibration,
   model: ModelConstants = MODEL,
-): { implied: number; categoryMultiple: number; growthPct: number; growthMult: number; ageMult: number; chainMult: number; age: number | null } {
+): { implied: number; categoryMultiple: number; sizeMult: number; growthPct: number; growthMult: number; ageMult: number; chainMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
   const growth = growthFactor(protocol.change_7d, model);
   const ageMult = ageFactor(age, model);
   const chainMult = chainFactor(protocol.chains.length, model);
   const catMult = categoryMultiple(protocol.category, calibration, model);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * catMult * growth.factor * ageMult * chainMult));
-  return { implied, categoryMultiple: catMult, growthPct: growth.pct, growthMult: growth.factor, ageMult, chainMult, age };
+  const sizeMult = sizeFactor(protocol.tvl_usd, protocol.category, calibration, model);
+  const implied = Math.max(1, Math.round(protocol.tvl_usd * catMult * sizeMult * growth.factor * ageMult * chainMult));
+  return { implied, categoryMultiple: catMult, sizeMult, growthPct: growth.pct, growthMult: growth.factor, ageMult, chainMult, age };
 }
 
 /** A name ending in a version number marks a pool of some other protocol, not a protocol. */
 const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
+
+/** True when the name marks a versioned pool of some other protocol, not a protocol. */
+export function isVersionedPool(name: string): boolean {
+  return VERSIONED.test(name);
+}
 
 /** True when the record shows no token anywhere: no market cap, no CoinGecko id, no symbol. */
 export function isPreToken(p: SnapshotProtocol): boolean {
@@ -386,6 +509,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     implied_value_usd: s.implied,
     model: {
       category_multiple: round4dp(s.categoryMultiple),
+      size_multiplier: round4dp(s.sizeMult),
       growth_pct: s.growthPct,
       growth_multiplier: round4dp(s.growthMult),
       age_multiplier: round4dp(s.ageMult),
@@ -459,8 +583,10 @@ function weeklyAction(p: SnapshotProtocol): string {
 }
 
 /**
- * Six steps for farming a protocol, derived from its own record alone (category, chains,
- * TVL, age). No name is hand-listed anywhere in the plan.
+ * Seven steps for farming a protocol, derived from its own record alone (category, chains,
+ * TVL, age). Step zero is verification: confirm the protocol's own points or rewards
+ * page is live and the token has not launched before any money moves. No name is
+ * hand-listed anywhere in the plan.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = firstChain(p);
@@ -469,6 +595,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const action = entryActionFor(p, capital, chain);
   const weekly = weeklyAction(p);
   return [
+    {
+      text: `Before you deposit anything, open ${p.name}'s own points or rewards page and confirm it is still live and no token has launched yet.`,
+      cost: 'nothing to check, and never pay to claim',
+      time: '5 minutes',
+    },
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
@@ -534,6 +665,7 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     category_multiple: row.model.category_multiple,
+    size_multiplier: row.model.size_multiplier,
     growth_multiplier: row.model.growth_multiplier,
     age_multiplier: row.model.age_multiplier,
     chain_multiplier: row.model.chain_multiplier,

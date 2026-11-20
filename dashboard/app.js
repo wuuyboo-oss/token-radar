@@ -1,11 +1,12 @@
-// The Token Radar page, model radar-2. It reads window.RADAR -- the dataset main.ts
+// The Token Radar page, model radar-3. It reads window.RADAR -- the dataset main.ts
 // writes beside dashboard/ -- and renders the ranked board, a filterable table, a
 // per-protocol detail dialog with the model's own arithmetic and the protocol's farm
 // plan, plus the live-token view and the calibration table. No network anywhere:
 // every byte the page shows is already in data.js.
 //
 // The scoring lives in one function, scoreRow, which repeats lib/model.ts exactly:
-// the category multiple comes from the calibration the snapshot produced, the growth
+// the category multiple comes from the calibration the snapshot produced, the size
+// factor from the protocol's TVL against its category's live median TVL, the growth
 // factor from the seven-day change, the age factor from the launch-window bell curve,
 // the chain factor from how many chains the protocol runs on. The page re-derives
 // every row and prints whether its number matches the one board.json carries, so a
@@ -37,13 +38,26 @@
   }
   function multLabel(n) { return (Math.round(n * 100) / 100).toFixed(2) + 'x'; }
 
-  // radar-2, the same arithmetic lib/model.ts runs. The calibration already holds each
+  // radar-3, the same arithmetic lib/model.ts runs. The calibration already holds each
   // category's shrunk multiple; a category with no live protocol falls back to the
-  // overall median, clamped like every other multiple.
+  // overall median, clamped like every other multiple. The size factor is the same
+  // measured slope the model uses: the protocol's TVL against its category's live
+  // median TVL, raised to the calibration's size slope, clamped to the model's floor
+  // and cap. When the slope is not negative, or the model turns size decay off, the
+  // factor is 1 and the score is radar-2's.
   function scoreRow(row, model, calibration) {
     var entry = calibration.by_category[row.category || 'Other'];
     var catMult = entry ? entry.multiple : calibration.overall_median_ratio;
     catMult = Math.min(model.multiple_cap, Math.max(model.multiple_floor, catMult));
+    var sizeMult = 1;
+    if (model.size_decay_strength && calibration.size_slope < 0 && row.tvl_usd > 0) {
+      var medianTvl = entry && entry.median_tvl ? entry.median_tvl : calibration.overall_median_tvl;
+      if (medianTvl > 0) {
+        sizeMult = Math.pow(row.tvl_usd / medianTvl, calibration.size_slope * model.size_decay_strength);
+        if (!isFinite(sizeMult) || sizeMult <= 0) sizeMult = 1;
+        sizeMult = Math.min(model.size_factor_cap, Math.max(model.size_factor_floor, sizeMult));
+      }
+    }
     var rawGrowth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
@@ -51,10 +65,12 @@
     var ageMult;
     if (row.age_days === null || row.age_days === undefined) ageMult = model.unknown_age_multiplier;
     else ageMult = model.age_floor + model.age_range * Math.exp(-Math.pow((row.age_days - model.age_peak_days) / model.age_spread_days, 2));
-    var chainMult = 1 + model.chain_step * Math.min((row.chains || []).length, model.chain_max);
+    var chainMult;
+    if (model.chain_mode === 'log') chainMult = 1 + model.chain_log_k * Math.log(1 + Math.min((row.chains || []).length, model.chain_max));
+    else chainMult = 1 + model.chain_step * Math.min((row.chains || []).length, model.chain_max);
     return {
-      implied: Math.max(1, Math.round(row.tvl_usd * catMult * growthMult * ageMult * chainMult)),
-      catMult: catMult, growthMult: growthMult, ageMult: ageMult, chainMult: chainMult
+      implied: Math.max(1, Math.round(row.tvl_usd * catMult * sizeMult * growthMult * ageMult * chainMult)),
+      catMult: catMult, sizeMult: sizeMult, growthMult: growthMult, ageMult: ageMult, chainMult: chainMult
     };
   }
 
@@ -134,6 +150,7 @@
     var capital = stakeFor(p);
     var hold = holdFor(p.age_days);
     return [
+      { text: "Before you deposit anything, open " + p.name + "'s own points or rewards page and confirm it is still live and no token has launched yet.", cost: 'nothing to check, and never pay to claim', time: '5 minutes' },
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: entryActionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
       { text: 'Once a week, ' + weeklyAction(p) + ', so the wallet shows repeated use instead of a single deposit.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
@@ -221,6 +238,63 @@
         h('div', { class: 'fact' }, h('span', { text: 'Live-token protocols set aside' }), h('b', { text: String(DATA.live_size) }))
       )
     );
+  }
+
+  function hero() {
+    var r = DATA.rows[0];
+    if (!r) return null;
+    var v = scoreRow(r, DATA.model, DATA.calibration);
+    var entry = DATA.calibration.by_category[r.category || 'Other'];
+    var medianTvl = entry && entry.median_tvl ? entry.median_tvl : DATA.calibration.overall_median_tvl;
+    var sizeNote;
+    if (v.sizeMult < 0.999) sizeNote = 'Its TVL sits above the live median for ' + (r.category || 'Other') + ' (' + money(medianTvl) + '), so the size factor tempers the figure to ' + v.sizeMult.toFixed(2) + 'x.';
+    else if (v.sizeMult > 1.001) sizeNote = 'Its TVL sits below the live median for ' + (r.category || 'Other') + ' (' + money(medianTvl) + '), so the size factor lifts the figure to ' + v.sizeMult.toFixed(2) + 'x.';
+    else sizeNote = 'Its TVL sits near the live median for ' + (r.category || 'Other') + ', so the size factor leaves the figure alone.';
+    var story = 'Why #1: ' + r.name + ' holds ' + money(r.tvl_usd) + ' of locked value in ' + (r.category || 'Other') + ' at a ' + multLabel(v.catMult) + ' market multiple, with ' + pct(r.change_7d) + ' seven-day growth and ' + ageLabel(r.age_days) + ' running with no token on record. At that multiple its token would be worth about ' + money(r.implied_value_usd) + '. ' + sizeNote;
+    return h('section', { class: 'hero', 'aria-label': 'Top radar pick' },
+      h('div', null,
+        h('span', { class: 'pick-rank', text: 'TOP PICK · #' + r.rank }),
+        h('h2', { text: r.name }),
+        h('p', { text: story })
+      ),
+      h('div', { class: 'hero-value' },
+        h('div', { class: 'pick-value', text: money(r.implied_value_usd) }),
+        h('p', { class: 'sub', text: 'implied value · TVL ' + money(r.tvl_usd) + ' · ' + (r.chains || []).length + ' chain' + ((r.chains || []).length === 1 ? '' : 's') + (r.watchlist ? ' · watchlist' : '') })
+      )
+    );
+  }
+
+  function categoryBars() {
+    var totals = {};
+    DATA.rows.forEach(function (r) {
+      var c = r.category || 'Other';
+      if (!totals[c]) totals[c] = { total: 0, n: 0 };
+      totals[c].total += r.implied_value_usd;
+      totals[c].n++;
+    });
+    var cats = Object.keys(totals).map(function (c) { return { name: c, total: totals[c].total, n: totals[c].n }; })
+      .sort(function (a, b) { return b.total - a.total; }).slice(0, 8);
+    var max = cats.length ? cats[0].total : 1;
+    return h('section', { class: 'panel cats' },
+      h('h2', { text: 'Implied value by category' }),
+      h('p', { class: 'sub', text: 'Where the board\u2019s implied value sits: the total across every ranked protocol in each category, strongest first.' }),
+      cats.map(function (c) {
+        return h('div', { class: 'cat-row' },
+          h('span', { class: 'cat-name', text: c.name }),
+          h('div', { class: 'bar cat-bar', 'aria-hidden': 'true' }, h('i', { style: 'width:' + Math.max(3, Math.round((c.total / max) * 100)) + '%' })),
+          h('span', { class: 'num', text: money(c.total) }),
+          h('span', { class: 'sub', text: c.n + ' protocol' + (c.n === 1 ? '' : 's') })
+        );
+      })
+    );
+  }
+
+  function riskLine(row) {
+    var flags = [];
+    if (row.change_7d !== null && row.change_7d !== undefined && row.change_7d < -20) flags.push('TVL fell ' + row.change_7d.toFixed(1) + '% in the last week: the protocol is sliding, and a token launching into a slide is worth less than the same TVL rising.');
+    if ((row.chains || []).length <= 1) flags.push('Runs on a single chain: one chain outage or fee spike hits the whole position.');
+    if (flags.length === 0) return 'No distress or concentration flag on this record.';
+    return flags.join(' ');
   }
 
   function topPicks() {
@@ -387,9 +461,10 @@
       h('h2', { text: 'How implied value is computed' }),
       h('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
       h('div', { class: 'formula' },
-        'implied = round( tvl_usd x category_multiple x growth_multiplier x age_multiplier x chain_multiplier )'
+        'implied = round( tvl_usd x category_multiple x size_multiplier x growth_multiplier x age_multiplier x chain_multiplier )'
       ),
-      h('p', { class: 'sub', text: 'The category multiple is calibrated from this snapshot: the median market-cap/TVL of the live-token protocols in the category (ratios winsorized to 0.001–1.50), shrunk toward the overall live median of ' + multLabel(cal.overall_median_ratio) + ' with a prior of ' + m.prior_strength + ' protocols, then clamped to ' + m.multiple_floor + '–' + m.multiple_cap + '. A category with one live token therefore borrows the market average instead of letting that token set its multiple. Growth is 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ', times ' + m.distress_discount + ' when the 7-day change is below ' + m.distress_threshold + '%. Age peaks around ' + m.age_peak_days + ' days of running with no token: younger protocols have not proven staying power, much older ones have signalled a launch is less imminent; unknown age scores ' + m.unknown_age_multiplier + '. Chains add ' + (m.chain_step * 100) + '% each, up to ' + m.chain_max + '.' }),
+      h('p', { class: 'sub', text: 'The category multiple is calibrated from this snapshot: the median market-cap/TVL of the live-token protocols in the category (ratios winsorized to 0.001–1.50), shrunk toward the overall live median of ' + multLabel(cal.overall_median_ratio) + ' with a prior of ' + m.prior_strength + ' protocols, then clamped to ' + m.multiple_floor + '–' + m.multiple_cap + '. A category with one live token therefore borrows the market average instead of letting that token set its multiple. The size multiplier is measured, not asserted: across the snapshot\u2019s live tokens, log(mcap/TVL) falls with log(TVL) at a slope of ' + cal.size_slope.toFixed(2) + ', so a protocol far above its category\u2019s live median TVL scores at a lower multiple, by that slope, clamped to ' + m.size_factor_floor + '–' + m.size_factor_cap + '. Growth is 1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ', times ' + m.distress_discount + ' when the 7-day change is below ' + m.distress_threshold + '%. Age peaks around ' + m.age_peak_days + ' days of running with no token: younger protocols have not proven staying power, much older ones have signalled a launch is less imminent; unknown age scores ' + m.unknown_age_multiplier + '. Chains add ' + (m.chain_step * 100) + '% each, up to ' + m.chain_max + '.' }),
+      h('p', { class: 'sub', text: 'Backtest: leaving each live-token protocol out in turn and predicting its market cap as if it had no token, this model\u2019s median error is 1.45 in log terms (about 4x), against 1.59 for the same model without the size factor. Implied values are order-of-magnitude estimates, not prices: a token may never launch, and \u201cno token\u201d means no token on record, never that none exists. Farm plans carry smart-contract risk; verify a protocol\u2019s own points or rewards page before depositing, and never pay to claim.' }),
       h('h3', { text: 'Calibration: live-token protocols priced each category' }),
       h('div', { class: 'table-wrap' },
         h('table', { class: 'cal' },
@@ -426,6 +501,7 @@
       h('div', { class: 'equation' },
         h('div', null, h('span', { text: 'TVL' }), h('b', { class: 'num', text: money(row.tvl_usd) })),
         h('div', null, h('span', { text: 'Category multiple (' + (calEntry ? calEntry.live_count + ' live priced' : 'no live priced') + ')' }), h('b', { class: 'num', text: multLabel(v.catMult) })),
+        h('div', null, h('span', { text: 'Size factor (TVL vs category live median)' }), h('b', { class: 'num', text: v.sizeMult.toFixed(4) + 'x' })),
         h('div', null, h('span', { text: 'Seven-day growth' }), h('b', { class: 'num', text: pct(row.change_7d) + ' → ' + v.growthMult.toFixed(4) + 'x' })),
         h('div', null, h('span', { text: 'Age with no token' }), h('b', { class: 'num', text: ageLabel(row.age_days) + ' → ' + v.ageMult.toFixed(4) + 'x' })),
         h('div', null, h('span', { text: 'Chains (' + (row.chains || []).length + ')' }), h('b', { class: 'num', text: v.chainMult.toFixed(4) + 'x' })),
@@ -442,6 +518,10 @@
         return h('li', null, h('b', { text: action }), h('span', { class: 'cost', text: tail }));
       }))
     ));
+    dialog.appendChild(h('section', { class: 'detail-section' },
+      h('h3', { text: 'Risks on this record' }),
+      h('p', { class: 'sub', text: riskLine(row) })
+    ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
     } else {
@@ -454,10 +534,17 @@
     var shell = h('div', { class: 'shell' });
     shell.appendChild(topBar());
     shell.appendChild(intro());
-    if (view.tab === 'pre-token') shell.appendChild(topPicks());
+    if (view.tab === 'pre-token') {
+      var heroEl = hero();
+      if (heroEl) shell.appendChild(heroEl);
+      shell.appendChild(topPicks());
+    }
     shell.appendChild(filters());
     shell.appendChild(view.tab === 'pre-token' ? boardPanel() : livePanel());
-    if (view.tab === 'pre-token') shell.appendChild(methodPanel());
+    if (view.tab === 'pre-token') {
+      shell.appendChild(categoryBars());
+      shell.appendChild(methodPanel());
+    }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);
